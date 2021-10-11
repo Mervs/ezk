@@ -1,10 +1,11 @@
-use super::{Attribute, Error};
-use crate::{MessageBuilder, ParsedAttr, ParsedMessage};
+use super::Attribute;
+use crate::builder::MessageBuilder;
+use crate::parse::{ParsedAttr, ParsedMessage};
+use crate::Error;
 use bitfield::bitfield;
 use bytes::BufMut;
-use bytesstr::BytesStr;
 use std::convert::TryFrom;
-use std::io;
+use std::str::from_utf8;
 
 bitfield! {
     struct ErrorCodeHead(u32);
@@ -13,28 +14,33 @@ bitfield! {
 }
 
 /// [RFC8489](https://datatracker.ietf.org/doc/html/rfc8489#section-14.8)
-pub struct ErrorCode {
+pub struct ErrorCode<'s> {
     pub number: u32,
-    pub reason: BytesStr,
+    pub reason: &'s str,
 }
 
-impl Attribute for ErrorCode {
+impl<'s> Attribute<'s> for ErrorCode<'s> {
     type Context = ();
     const TYPE: u16 = 0x0009;
 
-    fn decode(_: Self::Context, _: &ParsedMessage, attr: &ParsedAttr) -> Result<Self, Error> {
-        if attr.value.len() < 4 {
+    fn decode(
+        _: Self::Context,
+        msg: &'s mut ParsedMessage,
+        attr: ParsedAttr,
+    ) -> Result<Self, Error> {
+        let value = attr.get_value(msg.buffer());
+
+        if value.len() < 4 {
             return Err(Error::InvalidData("error code must be at least 4 bytes"));
         }
 
-        let head = u32::from_ne_bytes([attr.value[0], attr.value[1], attr.value[2], attr.value[3]]);
+        let head = u32::from_ne_bytes([value[0], value[1], value[2], value[3]]);
         let head = ErrorCodeHead(head);
 
-        let reason = if attr.value.len() > 4 {
-            BytesStr::from_utf8_bytes(attr.value.slice(4..))
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+        let reason = if value.len() > 4 {
+            from_utf8(&value[4..])?
         } else {
-            BytesStr::empty()
+            ""
         };
 
         Ok(Self {

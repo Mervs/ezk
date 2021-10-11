@@ -1,21 +1,29 @@
-use super::{Attribute, Error, NE};
-use crate::{padding_usize, MessageBuilder, ParsedAttr, ParsedMessage};
+use super::Attribute;
+use crate::builder::MessageBuilder;
+use crate::parse::{ParsedAttr, ParsedMessage};
+use crate::{padding_usize, Error, NE};
 use byteorder::ReadBytesExt;
-use bytes::{Buf, BufMut, Bytes};
+use bytes::{Buf, BufMut};
 use std::convert::TryFrom;
 use std::io::Cursor;
 
 /// [RFC8489](https://datatracker.ietf.org/doc/html/rfc8489#section-14.11)
-pub struct PasswordAlgorithms {
-    algorithms: Vec<(u16, Bytes)>,
+pub struct PasswordAlgorithms<'s> {
+    algorithms: Vec<(u16, &'s [u8])>,
 }
 
-impl Attribute for PasswordAlgorithms {
+impl<'s> Attribute<'s> for PasswordAlgorithms<'s> {
     type Context = ();
     const TYPE: u16 = 0x8002;
 
-    fn decode(_: Self::Context, _: &ParsedMessage, attr: &ParsedAttr) -> Result<Self, Error> {
-        let mut cursor = Cursor::new(&attr.value);
+    fn decode(
+        _: Self::Context,
+        msg: &'s mut ParsedMessage,
+        attr: ParsedAttr,
+    ) -> Result<Self, Error> {
+        let value = attr.get_value(msg.buffer());
+
+        let mut cursor = Cursor::new(value);
 
         let mut algorithms = vec![];
 
@@ -25,11 +33,11 @@ impl Attribute for PasswordAlgorithms {
 
             let pos = usize::try_from(cursor.position())?;
 
-            if attr.value.len() < pos + len {
+            if value.len() < pos + len {
                 return Err(Error::InvalidData("invalid algorithm len"));
             }
 
-            let params = attr.value.slice(pos..pos + len);
+            let params = &value[pos..pos + len];
 
             algorithms.push((alg, params));
         }
@@ -60,5 +68,59 @@ impl Attribute for PasswordAlgorithms {
         }
 
         Ok(u16::try_from(len)?)
+    }
+}
+
+/// [RFC8489](https://datatracker.ietf.org/doc/html/rfc8489#section-14.12)
+pub struct PasswordAlgorithm<'s> {
+    algorithm: u16,
+    params: &'s [u8],
+}
+
+impl<'s> Attribute<'s> for PasswordAlgorithm<'s> {
+    type Context = ();
+    const TYPE: u16 = 0x001D;
+
+    fn decode(
+        _: Self::Context,
+        msg: &'s mut ParsedMessage,
+        attr: ParsedAttr,
+    ) -> Result<Self, Error> {
+        let value = attr.get_value(msg.buffer());
+
+        let mut cursor = Cursor::new(value);
+
+        let alg = cursor.read_u16::<NE>()?;
+        let len = usize::from(cursor.read_u16::<NE>()?);
+
+        let pos = usize::try_from(cursor.position())?;
+
+        if value.len() < pos + len {
+            return Err(Error::InvalidData("invalid algorithm len"));
+        }
+
+        let params = &value[pos..pos + len];
+
+        Ok(Self {
+            algorithm: alg,
+            params,
+        })
+    }
+
+    fn encode(&self, _: Self::Context, builder: &mut MessageBuilder) -> Result<(), Error> {
+        let padding = padding_usize(self.params.len());
+
+        builder.buffer().put_u16(self.algorithm);
+        builder.buffer().put_u16(u16::try_from(self.params.len())?);
+        builder.buffer().extend_from_slice(self.params);
+        builder.buffer().extend((0..padding).map(|_| 0));
+
+        Ok(())
+    }
+
+    fn encode_len(&self) -> Result<u16, Error> {
+        Ok(u16::try_from(
+            4 + self.params.len() + padding_usize(self.params.len()),
+        )?)
     }
 }

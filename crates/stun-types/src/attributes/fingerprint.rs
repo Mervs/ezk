@@ -1,5 +1,7 @@
-use super::{Attribute, Error, NE};
-use crate::{MessageBuilder, ParsedAttr, ParsedMessage};
+use super::Attribute;
+use crate::builder::MessageBuilder;
+use crate::parse::{ParsedAttr, ParsedMessage};
+use crate::{Error, NE};
 use byteorder::ReadBytesExt;
 use bytes::BufMut;
 use std::io::Cursor;
@@ -56,18 +58,20 @@ impl Fingerprint {
     }
 }
 
-impl Attribute for Fingerprint {
+impl Attribute<'_> for Fingerprint {
     type Context = ();
     const TYPE: u16 = 0x8028;
 
-    fn decode(_: Self::Context, msg: &ParsedMessage, attr: &ParsedAttr) -> Result<Self, Error> {
-        if attr.value.len() != 4 {
+    fn decode(_: Self::Context, msg: &mut ParsedMessage, attr: ParsedAttr) -> Result<Self, Error> {
+        let value = attr.get_value(msg.buffer());
+
+        if value.len() != 4 {
             return Err(Error::InvalidData("fingerprint value must be 4 bytes"));
         }
 
-        let attr_value = Cursor::new(&attr.value).read_u32::<NE>()?;
+        let attr_value = Cursor::new(&value).read_u32::<NE>()?;
 
-        let data = &msg.buffer()[..attr.attr_idx];
+        let data = &msg.buffer()[..attr.begin];
 
         let crc = Self::crc32(data) ^ 0x5354554e;
 

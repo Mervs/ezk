@@ -1,11 +1,62 @@
 use bytes::Bytes;
-use bytesstr::BytesStr;
 use std::net::SocketAddr;
-use stun_types::{
-    attributes::Software, transaction_id, AttrInsertQueue, Class, MessageBuilder, Method,
+use stun_types::attributes::{
+    MessageIntegrity, MessageIntegrityKey, MessageIntegritySha256, Realm, Software, Username,
 };
+use stun_types::builder::MessageBuilder;
+use stun_types::header::{Class, Method};
+use stun_types::{transaction_id, Error};
 
 mod uri;
+
+pub enum StunCredential {
+    ShortTerm {
+        username: String,
+        password: String,
+    },
+    LongTerm {
+        realm: String,
+        username: String,
+        password: String,
+    },
+}
+
+impl StunCredential {
+    fn auth_msg(&mut self, mut msg: MessageBuilder) -> Result<(), Error> {
+        match &*self {
+            StunCredential::ShortTerm { username, password } => {
+                msg.add_attr(&Username::new(username))?;
+                msg.add_attr_with(
+                    &MessageIntegritySha256::default(),
+                    MessageIntegrityKey::new_short_term(password),
+                )?;
+                msg.add_attr_with(
+                    &MessageIntegrity::default(),
+                    MessageIntegrityKey::new_short_term(password),
+                )?;
+
+                todo!()
+            }
+            StunCredential::LongTerm {
+                realm,
+                username,
+                password,
+            } => {
+                msg.add_attr(&Realm::new(realm))?;
+                msg.add_attr(&Username::new(username))?;
+
+                todo!()
+            }
+        }
+    }
+}
+
+pub struct StunCredentials {
+    realm: Option<String>,
+    username: String,
+    password: String,
+    nonce: Option<String>,
+}
 
 pub struct StunServer {
     addr: SocketAddr,
@@ -27,19 +78,19 @@ impl Client {
     }
 
     fn binding_request(&self) -> Bytes {
-        let message = MessageBuilder::new(Class::Request, Method::Binding, transaction_id());
-        let software = Software(BytesStr::from_static("ezk-stun"));
+        let mut message = MessageBuilder::new(Class::Request, Method::Binding, transaction_id());
 
-        let mut attrs = AttrInsertQueue::new();
-        attrs.add_attr(&software);
+        message.add_attr(&Software::new("ezk-stun")).unwrap();
 
-        message.finish(attrs).unwrap()
+        message.finish()
     }
 }
 
 #[cfg(test)]
 mod test {
 
+    use bytes::BytesMut;
+    use stun_types::parse::ParsedMessage;
     use tokio::net::{lookup_host, UdpSocket};
 
     use super::*;
@@ -55,14 +106,19 @@ mod test {
         let client = Client::new(StunServer { addr });
 
         let binding_request = client.binding_request();
+        println!("{:02X?}", &binding_request[..]);
 
         let udp = UdpSocket::bind("0.0.0.0:0").await.unwrap();
 
         udp.send_to(&binding_request, addr).await.unwrap();
 
-        let mut buf = vec![0; 65535];
+        let mut buf = BytesMut::new();
+        buf.resize(65535, 0);
+
         let (len, remote) = udp.recv_from(&mut buf).await.unwrap();
 
-        println!("{:02X?}", &buf[..len]);
+        buf.truncate(len);
+
+        ParsedMessage::parse(buf).unwrap().unwrap();
     }
 }

@@ -1,43 +1,35 @@
-use super::NE;
-use crate::{padding_usize, MessageBuilder, ParsedAttr, ParsedMessage};
+use crate::builder::MessageBuilder;
+use crate::parse::{ParsedAttr, ParsedMessage};
+use crate::{Error, NE};
 use byteorder::ReadBytesExt;
-use bytes::{Buf, BufMut, Bytes};
-use bytesstr::BytesStr;
-use hmac::digest::Digest;
-use sha2::Sha256;
+use bytes::{Buf, BufMut};
 use std::convert::TryFrom;
-use std::io;
 use std::io::Cursor;
-use std::num::TryFromIntError;
-use std::str::Utf8Error;
+use std::str::from_utf8;
 
 mod addr;
 mod error_code;
 mod fingerprint;
 mod integrity;
 mod password_algs;
+mod user_hash;
 
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    #[error("invalid input data, {0}")]
-    InvalidData(&'static str),
-    #[error("failed to convert integer")]
-    TryFromInt(#[from] TryFromIntError),
-    #[error(transparent)]
-    Utf8(#[from] Utf8Error),
-}
+pub use addr::*;
+pub use error_code::ErrorCode;
+pub use fingerprint::Fingerprint;
+pub use integrity::*;
+pub use password_algs::*;
+pub use user_hash::*;
 
-impl From<io::Error> for Error {
-    fn from(_: io::Error) -> Self {
-        Self::InvalidData("failed to read from buffer")
-    }
-}
-
-pub trait Attribute {
+pub trait Attribute<'s> {
     type Context;
     const TYPE: u16;
 
-    fn decode(ctx: Self::Context, msg: &ParsedMessage, attr: &ParsedAttr) -> Result<Self, Error>
+    fn decode(
+        ctx: Self::Context,
+        msg: &'s mut ParsedMessage,
+        attr: ParsedAttr,
+    ) -> Result<Self, Error>
     where
         Self: Sized;
 
@@ -46,15 +38,24 @@ pub trait Attribute {
     fn encode_len(&self) -> Result<u16, Error>;
 }
 
-/// [RFC8489](https://datatracker.ietf.org/doc/html/rfc8489#section-14.3)
-pub struct Username(pub BytesStr);
+pub struct StringAttribute<'s, const TYPE: u16>(pub &'s str);
 
-impl Attribute for Username {
+impl<'s, const TYPE: u16> StringAttribute<'s, TYPE> {
+    pub fn new(s: &'s str) -> Self {
+        Self(s)
+    }
+}
+
+impl<'s, const TYPE: u16> Attribute<'s> for StringAttribute<'s, TYPE> {
     type Context = ();
-    const TYPE: u16 = 0x0006;
+    const TYPE: u16 = TYPE;
 
-    fn decode(_: Self::Context, _: &ParsedMessage, attr: &ParsedAttr) -> Result<Self, Error> {
-        Ok(Self(BytesStr::from_utf8_bytes(attr.value.clone())?))
+    fn decode(
+        _: Self::Context,
+        msg: &'s mut ParsedMessage,
+        attr: ParsedAttr,
+    ) -> Result<Self, Error> {
+        Ok(Self(from_utf8(attr.get_value(msg.buffer()))?))
     }
 
     fn encode(&self, _: Self::Context, builder: &mut MessageBuilder) -> Result<(), Error> {
@@ -67,141 +68,54 @@ impl Attribute for Username {
     }
 }
 
-/// [RFC8489](https://datatracker.ietf.org/doc/html/rfc8489#section-14.4)
-pub struct UserHash(pub [u8; 32]);
+pub struct BytesAttribute<'s, const TYPE: u16>(pub &'s [u8]);
 
-impl UserHash {
-    pub fn new(username: &str, realm: &str) -> Self {
-        let input = format!("{}:{}", username, realm);
-        let output = Sha256::digest(input.as_bytes());
-
-        Self(output.into())
+impl<'s, const TYPE: u16> BytesAttribute<'s, TYPE> {
+    pub fn new(s: &'s [u8]) -> Self {
+        Self(s)
     }
 }
 
-impl Attribute for UserHash {
+impl<'s, const TYPE: u16> Attribute<'s> for BytesAttribute<'s, TYPE> {
     type Context = ();
-    const TYPE: u16 = 0x001E;
+    const TYPE: u16 = TYPE;
 
-    fn decode(_: Self::Context, _: &ParsedMessage, attr: &ParsedAttr) -> Result<Self, Error> {
-        if attr.value.len() != 32 {
-            return Err(Error::InvalidData("user hash buf must be 32 bytes"));
-        }
-
-        Ok(Self(<[u8; 32]>::try_from(attr.value.as_ref()).unwrap()))
+    fn decode(
+        _: Self::Context,
+        msg: &'s mut ParsedMessage,
+        attr: ParsedAttr,
+    ) -> Result<Self, Error> {
+        Ok(Self(attr.get_value(msg.buffer())))
     }
 
     fn encode(&self, _: Self::Context, builder: &mut MessageBuilder) -> Result<(), Error> {
-        builder.buffer().extend_from_slice(&self.0);
+        builder.buffer().extend_from_slice(self.0);
         Ok(())
     }
 
     fn encode_len(&self) -> Result<u16, Error> {
-        Ok(32)
+        Ok(u16::try_from(self.0.len())?)
     }
 }
+
+/// [RFC8489](https://datatracker.ietf.org/doc/html/rfc8489#section-14.3)
+pub type Username<'s> = StringAttribute<'s, 0x0006>;
 
 /// [RFC8489](https://datatracker.ietf.org/doc/html/rfc8489#section-14.9)
-pub struct Realm(pub BytesStr);
-
-impl Attribute for Realm {
-    type Context = ();
-    const TYPE: u16 = 0x0014;
-
-    fn decode(_: Self::Context, _: &ParsedMessage, attr: &ParsedAttr) -> Result<Self, Error> {
-        Ok(Self(BytesStr::from_utf8_bytes(attr.value.clone())?))
-    }
-
-    fn encode(&self, _: Self::Context, builder: &mut MessageBuilder) -> Result<(), Error> {
-        builder.buffer().extend_from_slice(self.0.as_ref());
-        Ok(())
-    }
-
-    fn encode_len(&self) -> Result<u16, Error> {
-        Ok(u16::try_from(self.0.len())?)
-    }
-}
+pub type Realm<'s> = StringAttribute<'s, 0x0014>;
 
 /// [RFC8489](https://datatracker.ietf.org/doc/html/rfc8489#section-14.10)
-pub struct Nonce(pub Bytes);
-
-impl Attribute for Nonce {
-    type Context = ();
-    const TYPE: u16 = 0x0015;
-
-    fn decode(_: Self::Context, _: &ParsedMessage, attr: &ParsedAttr) -> Result<Self, Error> {
-        Ok(Self(attr.value.clone()))
-    }
-
-    fn encode(&self, _: Self::Context, builder: &mut MessageBuilder) -> Result<(), Error> {
-        builder.buffer().extend_from_slice(&self.0);
-        Ok(())
-    }
-
-    fn encode_len(&self) -> Result<u16, Error> {
-        Ok(u16::try_from(self.0.len())?)
-    }
-}
-
-/// [RFC8489](https://datatracker.ietf.org/doc/html/rfc8489#section-14.12)
-pub struct PasswordAlgorithm {
-    algorithm: u16,
-    params: Bytes,
-}
-
-impl Attribute for PasswordAlgorithm {
-    type Context = ();
-    const TYPE: u16 = 0x001D;
-
-    fn decode(_: Self::Context, _: &ParsedMessage, attr: &ParsedAttr) -> Result<Self, Error> {
-        let mut cursor = Cursor::new(&attr.value);
-
-        let alg = cursor.read_u16::<NE>()?;
-        let len = usize::from(cursor.read_u16::<NE>()?);
-
-        let pos = usize::try_from(cursor.position())?;
-
-        if attr.value.len() < pos + len {
-            return Err(Error::InvalidData("invalid algorithm len"));
-        }
-
-        let params = attr.value.slice(pos..pos + len);
-
-        Ok(Self {
-            algorithm: alg,
-            params,
-        })
-    }
-
-    fn encode(&self, _: Self::Context, builder: &mut MessageBuilder) -> Result<(), Error> {
-        let padding = padding_usize(self.params.len());
-
-        builder.buffer().put_u16(self.algorithm);
-        builder.buffer().put_u16(u16::try_from(self.params.len())?);
-        builder.buffer().extend_from_slice(&self.params);
-        builder.buffer().extend((0..padding).map(|_| 0));
-
-        Ok(())
-    }
-
-    fn encode_len(&self) -> Result<u16, Error> {
-        Ok(u16::try_from(
-            4 + self.params.len() + padding_usize(self.params.len()),
-        )?)
-    }
-}
+pub type Nonce<'s> = BytesAttribute<'s, 0x0015>;
 
 /// [RFC8489](https://datatracker.ietf.org/doc/html/rfc8489#section-14.13)
-pub struct UnknownAttributes {
-    attributes: Vec<u16>,
-}
+pub struct UnknownAttributes(pub Vec<u16>);
 
-impl Attribute for UnknownAttributes {
+impl Attribute<'_> for UnknownAttributes {
     type Context = ();
     const TYPE: u16 = 0x000A;
 
-    fn decode(_: Self::Context, _: &ParsedMessage, attr: &ParsedAttr) -> Result<Self, Error> {
-        let mut cursor = Cursor::new(&attr.value);
+    fn decode(_: Self::Context, msg: &mut ParsedMessage, attr: ParsedAttr) -> Result<Self, Error> {
+        let mut cursor = Cursor::new(attr.get_value(msg.buffer()));
 
         let mut attributes = vec![];
 
@@ -209,11 +123,11 @@ impl Attribute for UnknownAttributes {
             attributes.push(cursor.read_u16::<NE>()?);
         }
 
-        Ok(Self { attributes })
+        Ok(Self(attributes))
     }
 
     fn encode(&self, _: Self::Context, builder: &mut MessageBuilder) -> Result<(), Error> {
-        for &attr in &self.attributes {
+        for &attr in &self.0 {
             builder.buffer().put_u16(attr);
         }
 
@@ -221,48 +135,12 @@ impl Attribute for UnknownAttributes {
     }
 
     fn encode_len(&self) -> Result<u16, Error> {
-        Ok(u16::try_from(self.attributes.len() * 2)?)
+        Ok(u16::try_from(self.0.len() * 2)?)
     }
 }
 
 /// [RFC8489](https://datatracker.ietf.org/doc/html/rfc8489#section-14.14)
-pub struct Software(pub BytesStr);
-
-impl Attribute for Software {
-    type Context = ();
-    const TYPE: u16 = 0x8022;
-
-    fn decode(_: Self::Context, _: &ParsedMessage, attr: &ParsedAttr) -> Result<Self, Error> {
-        Ok(Self(BytesStr::from_utf8_bytes(attr.value.clone())?))
-    }
-
-    fn encode(&self, _: Self::Context, builder: &mut MessageBuilder) -> Result<(), Error> {
-        builder.buffer().extend_from_slice(self.0.as_ref());
-        Ok(())
-    }
-
-    fn encode_len(&self) -> Result<u16, Error> {
-        Ok(u16::try_from(self.0.len())?)
-    }
-}
+pub type Software<'s> = StringAttribute<'s, 0x8022>;
 
 /// [RFC8489](https://datatracker.ietf.org/doc/html/rfc8489#section-14.15)
-pub struct AlternateDomain(pub Bytes);
-
-impl Attribute for AlternateDomain {
-    type Context = ();
-    const TYPE: u16 = 0x8003;
-
-    fn decode(_: Self::Context, _: &ParsedMessage, attr: &ParsedAttr) -> Result<Self, Error> {
-        Ok(Self(attr.value.clone()))
-    }
-
-    fn encode(&self, _: Self::Context, builder: &mut MessageBuilder) -> Result<(), Error> {
-        builder.buffer().extend_from_slice(&self.0);
-        Ok(())
-    }
-
-    fn encode_len(&self) -> Result<u16, Error> {
-        Ok(u16::try_from(self.0.len())?)
-    }
-}
+pub type AlternateDomain<'s> = BytesAttribute<'s, 0x8003>;

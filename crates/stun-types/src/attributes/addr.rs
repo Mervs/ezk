@@ -1,13 +1,15 @@
-use super::{Attribute, Error};
-use crate::{MessageBuilder, ParsedAttr, ParsedMessage, COOKIE, NE};
+use super::Attribute;
+use crate::builder::MessageBuilder;
+use crate::parse::{ParsedAttr, ParsedMessage};
+use crate::{Error, COOKIE, NE};
 use byteorder::ReadBytesExt;
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{BufMut, BytesMut};
 use std::io::Cursor;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
 const XOR16: u16 = (COOKIE & 0xFFFF) as u16;
 
-fn decode_addr(buf: &Bytes, xor16: u16, xor32: u32, xor128: u128) -> Result<SocketAddr, Error> {
+fn decode_addr(buf: &[u8], xor16: u16, xor32: u32, xor128: u128) -> Result<SocketAddr, Error> {
     let mut cursor = Cursor::new(buf);
 
     if cursor.read_u8()? != 0 {
@@ -62,13 +64,13 @@ fn encode_addr(addr: SocketAddr, buf: &mut BytesMut, xor16: u16, xor32: u32, xor
 /// [RFC8489](https://datatracker.ietf.org/doc/html/rfc8489#section-14.1)
 pub struct MappedAddress(pub SocketAddr);
 
-impl Attribute for MappedAddress {
+impl Attribute<'_> for MappedAddress {
     type Context = ();
 
     const TYPE: u16 = 0x0001;
 
-    fn decode(_: Self::Context, _: &ParsedMessage, attr: &ParsedAttr) -> Result<Self, Error> {
-        decode_addr(&attr.value, 0, 0, 0).map(Self)
+    fn decode(_: Self::Context, msg: &mut ParsedMessage, attr: ParsedAttr) -> Result<Self, Error> {
+        decode_addr(attr.get_value(msg.buffer()), 0, 0, 0).map(Self)
     }
 
     fn encode(&self, _: Self::Context, builder: &mut MessageBuilder) -> Result<(), Error> {
@@ -87,13 +89,13 @@ impl Attribute for MappedAddress {
 /// [RFC8489](https://datatracker.ietf.org/doc/html/rfc8489#section-14.3)
 pub struct XorMappedAddress(pub SocketAddr);
 
-impl Attribute for XorMappedAddress {
+impl Attribute<'_> for XorMappedAddress {
     type Context = ();
     const TYPE: u16 = 0x0020;
 
-    fn decode(_: Self::Context, msg: &ParsedMessage, attr: &ParsedAttr) -> Result<Self, Error> {
+    fn decode(_: Self::Context, msg: &mut ParsedMessage, attr: ParsedAttr) -> Result<Self, Error> {
         let xor128 = msg.id().0;
-        decode_addr(&attr.value, XOR16, COOKIE, xor128).map(Self)
+        decode_addr(attr.get_value(msg.buffer()), XOR16, COOKIE, xor128).map(Self)
     }
 
     fn encode(&self, _: Self::Context, builder: &mut MessageBuilder) -> Result<(), Error> {
@@ -113,12 +115,12 @@ impl Attribute for XorMappedAddress {
 /// [RFC8489](https://datatracker.ietf.org/doc/html/rfc8489#section-14.15)
 pub struct AlternateServer(pub SocketAddr);
 
-impl Attribute for AlternateServer {
+impl Attribute<'_> for AlternateServer {
     type Context = ();
     const TYPE: u16 = 0x8023;
 
-    fn decode(_: Self::Context, _: &ParsedMessage, attr: &ParsedAttr) -> Result<Self, Error> {
-        decode_addr(&attr.value, 0, 0, 0).map(Self)
+    fn decode(_: Self::Context, msg: &mut ParsedMessage, attr: ParsedAttr) -> Result<Self, Error> {
+        decode_addr(attr.get_value(msg.buffer()), 0, 0, 0).map(Self)
     }
 
     fn encode(&self, _: Self::Context, builder: &mut MessageBuilder) -> Result<(), Error> {
